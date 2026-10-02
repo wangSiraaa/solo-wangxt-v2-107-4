@@ -42,7 +42,8 @@ func main() {
 	srv := api.NewServer(cfg, st, om, logger)
 
 	stop := make(chan struct{})
-	go cleanupLoop(context.Background(), st, cfg.CleanupInterval, cfg.AuthRequestTTL, logger, stop)
+	go cleanupLoop(context.Background(), st, cfg.CleanupInterval,
+		cfg.AuthRequestTTL, logger, stop)
 
 	httpServer := &http.Server{
 		Addr:              cfg.Addr,
@@ -70,11 +71,31 @@ func main() {
 	}
 }
 
-// cleanupLoop 周期性删除过期的 auth_request 行，防止 state 表无限增长。
+// cleanupLoop 周期性：
+//   - 删除过期的 auth_request 具体请求行，防止 state 表无限增长；
+//   - 把到期但仍 pending 的认证尝试终态化为 expired
+//     （进程重启后同样执行：未过期可继续恢复，已过期绝不重开）；
+//   - 清理早已终态的尝试行（具体请求随外键级联删除）。
 func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Duration,
 	logger *log.Logger, stop chan struct{}) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	run := func() {
+		now := time.Now()
+		if err := st.DeleteExpiredAuthRequests(ctx, now.Add(-ttl)); err != nil {
+			logger.Printf("cleanup auth_requests: %v", err)
+		}
+		if n, err := st.ExpirePendingAttempts(ctx, now); err != nil {
+			logger.Printf("expire auth attempts: %v", err)
+		} else if n > 0 {
+			logger.Printf("expired %d auth attempt(s)", n)
+		}
+		// 终态尝试保留 1 小时供界面查询，随后物理清理。
+		if err := st.DeleteSettledAttempts(ctx, now.Add(-time.Hour)); err != nil {
+			logger.Printf("delete settled auth attempts: %v", err)
+		}
+	}
+	run() // 启动即执行一次，覆盖重启场景。
 	for {
 		select {
 		case <-ctx.Done():
@@ -82,9 +103,7 @@ func cleanupLoop(ctx context.Context, st *store.Store, interval, ttl time.Durati
 		case <-stop:
 			return
 		case <-ticker.C:
-			if err := st.DeleteExpiredAuthRequests(ctx, time.Now().Add(-ttl)); err != nil {
-				logger.Printf("cleanup auth_requests: %v", err)
-			}
+			run()
 		}
 	}
 }

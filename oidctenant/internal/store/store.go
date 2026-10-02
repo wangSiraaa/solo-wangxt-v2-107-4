@@ -18,11 +18,18 @@ import (
 var (
 	// ErrNotFound 表示按主键/唯一键没有找到行。
 	ErrNotFound = errors.New("store: not found")
-	// ErrConsumed 表示 state 已被消费（回调重复到达）或根本不存在。
-	// 对二者返回同样的错误，避免通过接口枚举有效 state。
-	ErrConsumed = errors.New("store: auth request already consumed or unknown")
+	// ErrConsumed 表示 state 已被消费、已因恢复而失效，或根本不存在。
+	// 对三者返回同样的错误，避免通过接口枚举有效 state。
+	ErrConsumed = errors.New("store: auth request already consumed, invalidated or unknown")
 	// ErrConflict 表示唯一约束冲突（绑定冲突）。
 	ErrConflict = errors.New("store: unique constraint violation")
+	// ErrAttemptTerminal 表示认证尝试已进入终态（成功/永久失败/过期/重试耗尽），
+	// 迟到的旧回调、恢复或重复成功都不能再把它打开或回退。
+	ErrAttemptTerminal = errors.New("store: auth attempt already in a terminal state")
+	// ErrAttemptExpired 表示认证尝试或其关联上下文已过期。
+	ErrAttemptExpired = errors.New("store: auth attempt expired")
+	// ErrAttemptExhausted 表示暂时性失败后的重试次数已达上限。
+	ErrAttemptExhausted = errors.New("store: auth attempt retry budget exhausted")
 )
 
 type Store struct {
@@ -128,15 +135,19 @@ func (s *Store) UpsertProvider(ctx context.Context, p *models.Provider) error {
 func (s *Store) CreateAuthRequest(ctx context.Context, ar *models.AuthRequest) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO auth_requests
-		 (state, kind, tenant_id, idp_id, nonce, pkce_verifier, return_to, link_token, session_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-		ar.State, ar.Kind, ar.TenantID, ar.IDPID, ar.Nonce, ar.PKCEVerifier,
-		ar.ReturnTo, nullableStr(ar.LinkToken), ar.SessionID)
+		 (state, kind, tenant_id, idp_id, attempt_id, nonce, pkce_verifier,
+		  return_to, link_token, session_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		ar.State, ar.Kind, ar.TenantID, ar.IDPID, ar.AttemptID, ar.Nonce,
+		ar.PKCEVerifier, ar.ReturnTo, nullableStr(ar.LinkToken), ar.SessionID)
 	return mapErr(err)
 }
 
-// ConsumeAuthRequest 原子地取出并消费一个 state。
-// 重复回调（已消费）或伪造 state 一律返回 ErrConsumed。
+// ConsumeAuthRequest 原子地取出并消费一个具体请求的 state。
+//
+// 重复回调（已消费）、因“从暂时性失败恢复”而被失效的旧 state（invalidated_at）、
+// 或伪造 state，一律返回 ErrConsumed —— 旧 state 永久失效且无法与未知 state
+// 在响应上区分，杜绝枚举与重放。
 func (s *Store) ConsumeAuthRequest(ctx context.Context, state string) (*models.AuthRequest, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -146,12 +157,13 @@ func (s *Store) ConsumeAuthRequest(ctx context.Context, state string) (*models.A
 
 	var ar models.AuthRequest
 	err = tx.QueryRow(ctx,
-		`SELECT state, kind, tenant_id, idp_id, nonce, pkce_verifier, return_to,
-		        link_token, session_id, created_at
-		 FROM auth_requests WHERE state = $1 AND consumed_at IS NULL
+		`SELECT state, kind, tenant_id, idp_id, attempt_id, nonce, pkce_verifier,
+		        return_to, link_token, session_id, created_at
+		 FROM auth_requests
+		 WHERE state = $1 AND consumed_at IS NULL AND invalidated_at IS NULL
 		 FOR UPDATE`,
 		state,
-	).Scan(&ar.State, &ar.Kind, &ar.TenantID, &ar.IDPID, &ar.Nonce,
+	).Scan(&ar.State, &ar.Kind, &ar.TenantID, &ar.IDPID, &ar.AttemptID, &ar.Nonce,
 		&ar.PKCEVerifier, &ar.ReturnTo, &ar.LinkToken, &ar.SessionID, &ar.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

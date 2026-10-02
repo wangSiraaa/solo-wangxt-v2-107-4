@@ -9,6 +9,9 @@
 4. **登录/关联回调重复到达不会创建多个成员**（state 一次性消费 + 咨询锁 + 唯一约束）。
 5. **只允许已配置的回调地址**（精确白名单匹配）。
 6. **身份令牌绝不写进日志**（只记录错误分类，不记录 code/token）。
+7. **可恢复认证尝试**：提供方**暂时性**不可用时，用户意图可恢复 —— 在原意图下
+   生成全新的 state/nonce/PKCE 而无需从头开始；旧请求永久失效，
+   永久验证失败（签名/nonce/PKCE/受众/非法授权码）一律不可恢复。
 
 ## 目录结构
 
@@ -35,7 +38,8 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `identity_providers` | 租户**授权**的 `(issuer, client_id, secret, redirect_uris[])`，按 `(tenant_id, issuer)` 唯一 |
 | `members` | 租户内的成员（业务账号） |
 | `identities` | 已核实身份；**`UNIQUE(tenant_id, issuer, subject)` 是身份锚点**；`email` 无唯一约束 |
-| `auth_requests` | 进行中的授权请求：`state` 主键 + `nonce` + `pkce_verifier`，一次性消费（`consumed_at`） |
+| `auth_requests` | 每次具体 OIDC 请求：`state` 主键 + `nonce` + `pkce_verifier`，一次性消费（`consumed_at`），恢复后旧请求永久失效（`invalidated_at`）；归属某个 `auth_attempts` |
+| `auth_attempts` | 一次用户认证**意图**（登录/关联）：状态机、尝试次数/上限、失败分类、当前有效 state、恢复能力令牌（只存 SHA-256） |
 | `sessions` | 不透明会话令牌（数据库存 SHA-256 哈希） |
 | `link_sessions` | 账号关联会话：A/B 两条 leg 的 issuer/subject/auth_time，一次性 token |
 
@@ -54,6 +58,8 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | error_type | HTTP | 触发场景 |
 | --- | --- | --- |
 | `authentication_failed` | 401 | 签名/受众/issuer/过期/nonce/PKCE/授权码交换失败、会话无效 |
+| `provider_temporarily_unavailable` | 503 | 提供方暂时性错误（网络/超时/5xx/429/发现或 JWKS 暂时不可达）；**唯一可恢复类别**，响应带恢复入口 |
+| `recovery_unavailable` | 410 | 尝试已过期、重试次数耗尽或已终态；已完成流程不会因此回退 |
 | `tenant_unauthorized` | 403 | 租户未启用该 issuer、provider 被禁用、跨租户使用会话 |
 | `binding_conflict` | 409 | 目标身份已绑给别的成员、自关联、关联会话重放 |
 | `invalid_request` | 400 | state 缺失/已用/伪造、回调地址不在白名单、参数非法 |
@@ -66,6 +72,8 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
 | `GET  /healthz` | 健康检查 |
 | `GET  /t/{slug}/login?issuer=...&return_to=/...` | 发起登录，302 到 IdP |
 | `GET  /oauth/callback` | 登录回调（固定路径） |
+| `GET|POST /oauth/recover` | 从暂时性失败恢复：GET 302 到新授权地址（浏览器）；POST 返回新 `authorization_url`（API） |
+| `GET|POST /oauth/attempt` | 查询当前认证意图状态（pending/recoverable/终态），刷新/重启后决定“继续还是重来” |
 | `GET  /t/{slug}/api/me` | 当前成员与其已绑定身份（需会话 Cookie `sid`） |
 | `POST /t/{slug}/api/logout` | 吊销会话 |
 | `POST /t/{slug}/api/links` | 发起账号关联，返回 `link_token` 与 `link_url`；body `{"issuer":"..."}` |
@@ -91,9 +99,31 @@ integration/            针对真实 Keycloak + 真实 PostgreSQL 的端到端�
   B 是否已属于他人（冲突则整体回滚，不写入）。
 - **回调白名单**：`redirect_uri` 与 `identity_providers.redirect_uris` 做**精确**匹配，
   不做前缀/通配，杜绝 open redirect。
+- **可恢复认证尝试**（`auth_attempts` ↔ `auth_requests` 两层）：
+  - **意图与请求分离**：一次用户意图（登录或账号关联）落一行 `auth_attempts`，
+    每次对 IdP 的具体请求（state/nonce/PKCE）各落一行 `auth_requests`。
+  - **只恢复暂时性错误**：令牌端点 5xx/429、网络超时/连接失败、发现文档或 JWKS
+    暂时不可达才标记 `recoverable`；签名、issuer/受众、过期、**nonce**、**PKCE**、
+    `invalid_grant`（旧/重放授权码）等全部终态化为 `failed_permanent`，绝不恢复。
+  - **恢复即换新**：恢复在**单事务**内 `FOR UPDATE` 锁定意图，失效全部旧请求
+    （`invalidated_at`），插入全新 state/nonce/PKCE 并推进 `recover_generation`；
+    旧 state、旧授权码到达回调时与“未知 state”返回完全一致的 400。
+  - **重复恢复幂等**：双击/刷新恢复入口或并发恢复时，事务以 `recover_generation`
+    判定“后继是否已被别人创建”，已存在则复用同一后继 —— 任何时刻只有一个有效
+    具体请求，16 路并发恢复也只产生一个后继（见 store 并发测试）。
+  - **链接仍绑定原上下文**：链接意图的恢复必须由发起时的同一会话完成，
+    并始终绑定原成员/租户/目标 IdP；`link_sessions.b_state` 与新请求原子改绑。
+    关联会话一旦过期，恢复返回 410 且**不会被重新打开**。
+  - **终态不可回退**：成功是条件 `UPDATE ... WHERE status='pending'`；旧/新回调
+    乱序或同时到达时只有一个能越过该闸门，随后才创建成员/会话/绑定身份。
+  - **持久化**：状态、`attempts/max_attempts`（`MAX_AUTH_ATTEMPTS`，默认 3）、
+    失败分类、过期时间均落库；进程重启后未过期意图可凭恢复令牌继续，
+    过期意图由启动清理终态化。恢复令牌只存 SHA-256，经 HttpOnly `aat` cookie
+    或 API body/`Authorization: Bearer` 传递（绝不进 URL query 与日志）。
 - **日志脱敏**：访问日志把 query 中的 `code/id_token/access_token/refresh_token/state/token`
   统一替换为 `[REDACTED]`；认证失败只记录分类（signature/audience/nonce/...），
-  全代码路径不打印原始令牌。
+  全代码路径不打印原始令牌。503 恢复入口只暴露操作信息（重试计数、入口 URL），
+  不含 code/state/nonce/PKCE/token。
 
 ## 本地运行
 
@@ -130,13 +160,20 @@ http://localhost:8080/t/acme/login?issuer=http://localhost:8180/realms/acme
 
 ## 测试
 
-### 加密校验单元测试（不需要外部依赖）
+### 加密校验与可恢复尝试单元/集成测试（不需要 Keycloak）
 
 ```bash
+# 纯单测：失败分类（5xx/429 可恢复；签名/nonce/PKCE/invalid_grant 永久）
 go test ./internal/oidcx/...
+# 纯 store 层：并发恢复唯一后继、旧请求失效、终态不回退、链接绑定与过期
+go test ./internal/store/...
+# 端到端（进程内模拟 IdP + 嵌入式 PostgreSQL，无需 Keycloak）：
+go test ./integration/ -run 'TestRecover|TestOldStateAndCode|TestOldAndNew|TestPermanentFailures|TestOldCodeCannotPair|TestUnknownRecovery|TestIdPError' -v
 ```
 
-覆盖：合法令牌基线、错误 nonce、错误受众、过期、伪造 issuer、不受信密钥签名。
+覆盖：合法令牌基线、错误 nonce、错误受众、过期、伪造 issuer、不受信密钥签名；
+以及可恢复尝试的全部验收点（临时失败后换新成功、重复恢复唯一后继、旧 state/code
+被拒、永久失败不可恢复、重启后续跑、过期关联不重开、旧新回调并发不重复建成员）。
 
 ### 端到端集成测试（真实 Keycloak + 真实 PostgreSQL）
 

@@ -4,12 +4,19 @@ import (
 	"context"
 	"io"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func countRows(t *testing.T, env *testEnv, query string, args ...any) int {
+// dbHolder 由 *testEnv 与 *recoverEnv 共同实现。
+type dbHolder interface {
+	DB() *pgxpool.Pool
+}
+
+func countRows(t *testing.T, env dbHolder, query string, args ...any) int {
 	t.Helper()
 	var n int
-	if err := env.store.DB().QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
+	if err := env.DB().QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
 		t.Fatalf("countRows: %v (query=%s)", err, query)
 	}
 	return n

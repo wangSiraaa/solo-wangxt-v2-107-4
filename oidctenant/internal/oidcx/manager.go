@@ -72,7 +72,7 @@ func (m *Manager) get(ctx context.Context, issuer string, fingerprint time.Time)
 func (m *Manager) OAuth2Config(ctx context.Context, p *models.Provider, redirectURI string) (*oauth2.Config, error) {
 	prov, err := m.get(ctx, p.Issuer, p.UpdatedAt)
 	if err != nil {
-		return nil, err
+		return nil, ClassifyDiscoveryError(err)
 	}
 	return &oauth2.Config{
 		ClientID:     p.ClientID,
@@ -92,7 +92,7 @@ func (m *Manager) OAuth2Config(ctx context.Context, p *models.Provider, redirect
 func (m *Manager) Verifier(ctx context.Context, p *models.Provider, nonce string) (*Verifier, error) {
 	prov, err := m.get(ctx, p.Issuer, p.UpdatedAt)
 	if err != nil {
-		return nil, err
+		return nil, ClassifyDiscoveryError(err)
 	}
 	v := prov.Verifier(&gooidc.Config{
 		ClientID:                   p.ClientID,

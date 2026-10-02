@@ -24,6 +24,7 @@ import (
 
 	embedded "github.com/fergusstrange/embedded-postgres"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/example/oidctenant/internal/api"
 	"github.com/example/oidctenant/internal/config"
@@ -74,6 +75,9 @@ func kcBaseURL() string {
 	}
 	return kcBaseURLDefault
 }
+
+// DB 暴露连接池供通用断言辅助（dbHolder）使用。
+func (e *testEnv) DB() *pgxpool.Pool { return e.store.DB() }
 
 func issuer(realm string) string {
 	return kcBaseURL() + "/realms/" + realm

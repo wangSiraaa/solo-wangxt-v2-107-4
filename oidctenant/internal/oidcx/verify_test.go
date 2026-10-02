@@ -264,3 +264,131 @@ func TestVerifyRejectsBadSignature(t *testing.T) {
 		t.Fatalf("untrusted key error kind=%v, want signature", ve.Kind)
 	}
 }
+
+// TestPermanentVerifyFailuresNotTemporary 证明所有密码学/协议永久失败
+// 都不会被标记为可恢复。
+func TestPermanentVerifyFailuresNotTemporary(t *testing.T) {
+	idp := startTestIdP(t)
+	mgr, p := newManagerProvider(idp.issuer())
+	now := time.Now()
+	cases := []struct {
+		name string
+		raw  string
+		kind oidcx.VerifyKind
+	}{
+		{"bad_nonce", idp.issue(t, tokenInput{
+			Issuer: idp.issuer(), Subject: "u", Nonce: "other",
+			IssuedAt: now.Add(-time.Minute), Expiry: now.Add(time.Hour)}), oidcx.KindNonce},
+		{"bad_audience", idp.issue(t, tokenInput{
+			Issuer: idp.issuer(), Subject: "u", Nonce: "n", Audience: "other-c",
+			IssuedAt: now.Add(-time.Minute), Expiry: now.Add(time.Hour)}), oidcx.KindAudience},
+		{"expired", idp.issue(t, tokenInput{
+			Issuer: idp.issuer(), Subject: "u", Nonce: "n",
+			IssuedAt: now.Add(-2 * time.Hour), Expiry: now.Add(-time.Hour)}), oidcx.KindExpired},
+		{"bad_signature", idp.issueWithWrongKey(t, tokenInput{
+			Issuer: idp.issuer(), Subject: "u", Nonce: "n",
+			IssuedAt: now.Add(-time.Minute), Expiry: now.Add(time.Hour)}), oidcx.KindSignature},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ver, _ := mgr.Verifier(context.Background(), p, "n")
+			_, err := ver.Verify(context.Background(), tc.raw)
+			ve, ok := oidcx.AsVerifyError(err)
+			if !ok {
+				t.Fatalf("not a VerifyError: %v", err)
+			}
+			if ve.Temporary {
+				t.Fatalf("%s must not be recoverable", tc.name)
+			}
+			if ve.Kind != tc.kind {
+				t.Fatalf("%s kind=%s want %s", tc.name, ve.Kind, tc.kind)
+			}
+		})
+	}
+}
+
+// startTokenOnlyIdP 起一个只含发现文档与令牌端点的最小 IdP，
+// 令牌响应由 tokenHandler 决定；返回 issuer 基址。
+func startTokenOnlyIdP(t *testing.T, tokenHandler http.HandlerFunc) string {
+	t.Helper()
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+		  "issuer": %q,
+		  "authorization_endpoint": %q,
+		  "token_endpoint": %q,
+		  "jwks_uri": %q,
+		  "id_token_signing_alg_values_supported": ["RS256"],
+		  "response_types_supported": ["code"],
+		  "subject_types_supported": ["public"],
+		  "code_challenge_methods_supported": ["S256"]
+		}`, srv.URL, srv.URL+"/auth", srv.URL+"/token", srv.URL+"/jwks")
+	})
+	mux.HandleFunc("/token", tokenHandler)
+	return srv.URL
+}
+
+// TestExchangeFailureClassification 验证令牌端点失败的恢复语义：
+// 5xx/429 暂时性可恢复；400 invalid_grant（重放码/PKCE）永久不可恢复。
+func TestExchangeFailureClassification(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		body      string
+		temporary bool
+		wantKind  oidcx.VerifyKind
+	}{
+		{"503", http.StatusServiceUnavailable, `{"error":"server_error"}`, true, oidcx.KindProviderUnavailable},
+		{"500", http.StatusInternalServerError, `{"error":"server_error"}`, true, oidcx.KindProviderUnavailable},
+		{"429", http.StatusTooManyRequests, `{"error":"slow_down"}`, true, oidcx.KindProviderUnavailable},
+		{"400 invalid_grant", http.StatusBadRequest, `{"error":"invalid_grant"}`, false, oidcx.KindPKCE},
+		{"400 pkce", http.StatusBadRequest, `{"error":"invalid_grant","error_description":"code_verifier"}`,
+			false, oidcx.KindPKCE},
+		{"401", http.StatusUnauthorized, `{"error":"invalid_client"}`, false, oidcx.KindExchange},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			iss := startTokenOnlyIdP(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			mgr, p := newManagerProvider(iss)
+			cfg, err := mgr.OAuth2Config(context.Background(), p, "http://localhost/cb")
+			if err != nil {
+				t.Fatalf("oauth config: %v", err)
+			}
+			ver, err := mgr.Verifier(context.Background(), p, "n")
+			if err != nil {
+				t.Fatalf("verifier: %v", err)
+			}
+			_, _, xerr := mgr.ExchangeAndVerify(context.Background(), p, cfg, ver, "some-code", "verifier")
+			ve, ok := oidcx.AsVerifyError(xerr)
+			if !ok {
+				t.Fatalf("expected VerifyError, got %v", xerr)
+			}
+			if ve.Temporary != tc.temporary {
+				t.Fatalf("temporary=%v want %v (kind=%s)", ve.Temporary, tc.temporary, ve.Kind)
+			}
+			if ve.Kind != tc.wantKind {
+				t.Fatalf("kind=%s want %s", ve.Kind, tc.wantKind)
+			}
+		})
+	}
+}
+
+// TestDiscoveryFailureIsTemporary 验证发现文档暂时拉不到时为可恢复分类。
+func TestDiscoveryFailureIsTemporary(t *testing.T) {
+	// 指向一个立即关闭的服务器地址：连接被拒属暂时性网络故障。
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	srv.Close()
+	mgr, p := newManagerProvider(srv.URL)
+	if _, err := mgr.OAuth2Config(context.Background(), p, "http://localhost/cb"); err == nil {
+		t.Fatal("expected discovery failure")
+	} else if ve, ok := oidcx.AsVerifyError(err); !ok || !ve.Temporary {
+		t.Fatalf("discovery failure should be temporary, err=%v", err)
+	}
+}

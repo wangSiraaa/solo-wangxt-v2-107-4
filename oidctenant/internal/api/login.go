@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
 	sec "github.com/example/oidctenant/internal/auth"
@@ -62,10 +63,14 @@ func safeReturnTo(v string) string {
 }
 
 // GET /t/{slug}/login?issuer=...&return_to=/...
+//
+// 创建“认证意图 + 首个具体 OIDC 请求”（单事务落库），随后 302 到 IdP。
+// 即便发现文档暂时拉不到，意图与恢复能力令牌也已持久化 ——
+// 客户端拿到 503 的恢复入口，提供方恢复后可直接续跑而不必从头开始。
 func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
-	issuer := r.URL.Query().Get("issuer")
-	tenant, prov, ae := s.loadTenantProvider(r.Context(), slug, issuer)
+	issuerParam := r.URL.Query().Get("issuer")
+	tenant, prov, ae := s.loadTenantProvider(r.Context(), slug, issuerParam)
 	if ae != nil {
 		writeAPIError(w, ae)
 		return
@@ -93,28 +98,38 @@ func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "pkce generation failed"))
 		return
 	}
-
-	returnTo := safeReturnTo(r.URL.Query().Get("return_to"))
-	if err := s.store.CreateAuthRequest(r.Context(), &models.AuthRequest{
-		State:        state,
-		Kind:         "login",
-		TenantID:     tenant.ID,
-		IDPID:        prov.ID,
-		Nonce:        nonce,
-		PKCEVerifier: verifier,
-		ReturnTo:     returnTo,
-	}); err != nil {
-		s.logger.Printf("persist auth request failed: %v", err)
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "persist auth request failed"))
+	recoveryToken, err := sec.LinkToken()
+	if err != nil {
+		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "recovery token failed"))
 		return
 	}
+
+	returnTo := safeReturnTo(r.URL.Query().Get("return_to"))
+	attempt, err := s.store.CreateLoginAttempt(r.Context(), &store.CreateAttemptInput{
+		ID:                uuid.New(),
+		Kind:              "login",
+		TenantID:          tenant.ID,
+		IDPID:             prov.ID,
+		ReturnTo:          returnTo,
+		RecoveryTokenHash: sec.HashToken(recoveryToken),
+		State:             state,
+		Nonce:             nonce,
+		PKCEVerifier:      verifier,
+	}, s.cfg.AuthRequestTTL, s.cfg.MaxAuthAttempts)
+	if err != nil {
+		s.logger.Printf("persist auth attempt failed: %v", err)
+		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "persist auth attempt failed"))
+		return
+	}
+	s.setAttemptCookie(w, recoveryToken)
 
 	cfg, err := s.oidc.OAuth2Config(r.Context(), prov, redirectURI)
 	if err != nil {
-		s.logger.Printf("oidc config error: %v", err)
-		writeAPIError(w, authn("failed to initialize provider configuration"))
+		// 发现暂时不可用：意图已持久化，返回恢复入口而不是让用户从头开始。
+		s.handleDiscoveryFailure(w, r, attempt, recoveryToken, err)
 		return
 	}
+
 	challenge := oauth2.S256ChallengeFromVerifier(verifier)
 	authURL := oidcx.AuthCodeURL(cfg, state, nonce, challenge, "S256", false, nil)
 	http.Redirect(w, r, authURL, http.StatusFound)
@@ -122,23 +137,38 @@ func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 
 // GET /oauth/callback?state=...&code=...
 //
-// 重复到达（同一 state 两次）在 ConsumeAuthRequest 处被原子拦截，
-// 因此第二个回调绝不会再走“找到/创建成员”，也就不可能创建多个成员。
+// 多层防重放/防回退：
+//  1. state 原子消费：伪造/已用/已失效（恢复后的旧 state）得到一致的 400；
+//  2. 意图必须仍 pending：已成功的流程绝不可能因迟到回调回退；
+//  3. 成功终态化是条件 UPDATE：旧/新回调同时到达时只有一个能继续；
+//  4. 成员创建仍有咨询锁 + UNIQUE 锚点兜底。
+//
+// 令牌交换或验证遇到“明确的暂时性提供方错误”时，意图转为可恢复，
+// 当前具体请求永久失效，响应给出恢复入口；其余失败一律永久不可恢复。
 func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	state := q.Get("state")
 	code := q.Get("code")
+	if errParam := q.Get("error"); errParam != "" {
+		// IdP 在重定向里带回错误（access_denied/login_required/...）：授权已被
+		// IdP 终止，属终态失败，仅回传错误码（描述不可信），不给恢复入口。
+		// 若 state 可识别，顺手把意图终态化，避免悬挂一个 pending 尝试。
+		if state != "" {
+			if ar, cerr := s.store.ConsumeAuthRequest(r.Context(), state); cerr == nil {
+				_ = s.store.RecordAttemptPermanentFailure(r.Context(), ar.AttemptID,
+					"provider_error:"+sanitizeErrParam(errParam))
+			}
+		}
+		s.clearAttemptCookie(w)
+		writeAPIError(w, authn("provider returned error: "+sanitizeErrParam(errParam)))
+		return
+	}
 	if state == "" || code == "" {
 		writeAPIError(w, badRequest("missing state or code"))
 		return
 	}
-	if errParam := q.Get("error"); errParam != "" {
-		// IdP 返回的错误码本身不含敏感材料，但描述可能不可信，仅回传错误码。
-		writeAPIError(w, authn("provider returned error: "+sanitizeErrParam(errParam)))
-		return
-	}
 
-	// 原子取出并消费 state：伪造 state 与重放回调得到同样结果。
+	// 原子取出并消费 state：伪造/已消费/已失效 state 行为一致。
 	ar, err := s.store.ConsumeAuthRequest(r.Context(), state)
 	if err != nil {
 		writeAPIError(w, badRequest("authorization request is unknown or has already been used"))
@@ -148,46 +178,43 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, badRequest("state is not valid for the login callback"))
 		return
 	}
-
-	// 回调必须在租户仍授权该 issuer 的前提下继续。
-	prov, err := s.store.ProviderByID(r.Context(), ar.TenantID, ar.IDPID)
+	rawRecovery := recoveryCookieValue(r)
+	attempt, err := s.store.AttemptMustBePending(r.Context(), ar.AttemptID)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeAPIError(w, tenantForbidden("provider is no longer authorized for the tenant"))
-			return
-		}
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "lookup provider failed"))
+		// 意图已终态（成功/过期/永久失败）：迟到回调一律拒绝，不回退。
+		writeAPIError(w, badRequest("authorization request is unknown or has already been used"))
 		return
 	}
-	if !prov.Enabled {
-		writeAPIError(w, tenantForbidden("identity provider is disabled for the tenant"))
+
+	// 回调必须在租户仍授权该 issuer 的前提下继续。
+	prov, aerr := s.callbackProvider(w, r, attempt, ar.TenantID, ar.IDPID)
+	if aerr != nil {
+		writeAPIError(w, aerr)
 		return
 	}
 	redirectURI := s.redirectURLLogin()
 	if !sec.RedirectURIAllowed(prov.RedirectURIs, redirectURI) {
+		s.terminalizePolicyFailure(r, attempt, "redirect_not_allowed")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, badRequest("callback url is not registered for this provider"))
 		return
 	}
 
-	cfg, err := s.oidc.OAuth2Config(r.Context(), prov, redirectURI)
-	if err != nil {
-		s.logger.Printf("oidc config error: %v", err)
-		writeAPIError(w, authn("failed to initialize provider configuration"))
-		return
-	}
-	ver, err := s.oidc.Verifier(r.Context(), prov, ar.Nonce)
-	if err != nil {
-		s.logger.Printf("oidc verifier error: %v", err)
-		writeAPIError(w, authn("failed to initialize token verifier"))
+	cfg, ver, derr := s.buildOIDC(r.Context(), prov, redirectURI, ar.Nonce)
+	if derr != nil {
+		s.handleDiscoveryFailure(w, r, attempt, rawRecovery, derr)
 		return
 	}
 
 	// 令牌交换 + 签名/受众/issuer/过期/nonce/PKCE 校验。
-	// 授权码重放、PKCE 不匹配会在这里失败（state 已消费，不可再试）。
-	claims, _, err := s.oidc.ExchangeAndVerify(r.Context(), prov, cfg, ver, code, ar.PKCEVerifier)
-	if err != nil {
-		s.logVerifyFailure(err)
-		writeAPIError(w, authn("token exchange or id token verification failed"))
+	claims, _, xerr := s.oidc.ExchangeAndVerify(r.Context(), prov, cfg, ver, code, ar.PKCEVerifier)
+	if xerr != nil {
+		s.classifyAttemptFailure(w, r, attempt, rawRecovery, xerr)
+		return
+	}
+
+	// 条件终态化：只有一个回调（无论新旧 state）能越过这道闸门。
+	if !s.finishAttemptSuccess(w, r, attempt) {
 		return
 	}
 
@@ -226,6 +253,72 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
+// buildOIDC 构造 oauth2 config 与 ID token verifier。
+// 发现/构造失败返回原始错误，调用方用 classify 决定是否可恢复。
+func (s *Server) buildOIDC(ctx context.Context, prov *models.Provider,
+	redirectURI, nonce string) (*oauth2.Config, *oidcx.Verifier, error) {
+	cfg, err := s.oidc.OAuth2Config(ctx, prov, redirectURI)
+	if err != nil {
+		return nil, nil, err
+	}
+	ver, err := s.oidc.Verifier(ctx, prov, nonce)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cfg, ver, nil
+}
+
+// handleDiscoveryFailure 处理发现/构造阶段失败：暂时性给恢复入口，
+// 其余按永久失败终态化。
+func (s *Server) handleDiscoveryFailure(w http.ResponseWriter, r *http.Request,
+	a *models.AuthAttempt, rawToken string, err error) {
+	if ve, ok := oidcx.AsVerifyError(err); ok && ve.Temporary {
+		s.logVerifyFailure(err)
+		if recErr := s.store.RecordAttemptTemporaryFailure(r.Context(), a.ID, string(ve.Kind)); recErr != nil {
+			s.clearAttemptCookie(w)
+			writeAPIError(w, authn("this sign-in has already been finalized"))
+			return
+		}
+		refreshed, _ := s.store.AttemptByID(r.Context(), a.ID)
+		if refreshed != nil {
+			a = refreshed
+		}
+		s.writeRecoverable(w, a, rawToken, string(ve.Kind))
+		return
+	}
+	s.logger.Printf("oidc config error: %v", err)
+	_ = s.store.RecordAttemptPermanentFailure(r.Context(), a.ID, "config")
+	s.clearAttemptCookie(w)
+	writeAPIError(w, authn("failed to initialize provider configuration"))
+}
+
+// callbackProvider 解析回调对应 provider，策略变化（移除/禁用）永久终态化。
+func (s *Server) callbackProvider(w http.ResponseWriter, r *http.Request,
+	attempt *models.AuthAttempt, tenantID, idpID uuid.UUID) (*models.Provider, *APIError) {
+	prov, err := s.store.ProviderByID(r.Context(), tenantID, idpID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.terminalizePolicyFailure(r, attempt, "provider_removed")
+			s.clearAttemptCookie(w)
+			return nil, tenantForbidden("provider is no longer authorized for the tenant")
+		}
+		return nil, newAPIError(http.StatusInternalServerError, "internal_error", "lookup provider failed")
+	}
+	if !prov.Enabled {
+		s.terminalizePolicyFailure(r, attempt, "provider_disabled")
+		s.clearAttemptCookie(w)
+		return nil, tenantForbidden("identity provider is disabled for the tenant")
+	}
+	return prov, nil
+}
+
+func recoveryCookieValue(r *http.Request) string {
+	if c, err := r.Cookie(attemptCookie); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
 func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 	sec := http.Cookie{
 		Name:     sessionCookie,
@@ -242,7 +335,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 func (s *Server) logVerifyFailure(err error) {
 	if ve, ok := oidcx.AsVerifyError(err); ok {
 		// 只记录分类，不记录令牌或授权码。
-		s.logger.Printf("oidc verification failed: kind=%s", ve.Kind)
+		s.logger.Printf("oidc verification failed: kind=%s temporary=%t", ve.Kind, ve.Temporary)
 		return
 	}
 	s.logger.Printf("oidc verification failed (untyped)")

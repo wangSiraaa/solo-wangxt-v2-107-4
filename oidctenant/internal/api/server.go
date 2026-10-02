@@ -20,6 +20,8 @@ const (
 	callbackPath  = "/oauth/callback"
 	linkCBPath    = "/oauth/link/callback"
 	sessionCookie = "sid"
+	// attemptCookie 承载当前认证意图的恢复能力令牌（HttpOnly；只在恢复时使用）。
+	attemptCookie = "aat"
 )
 
 type ctxKey string
@@ -63,6 +65,12 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET "+linkCBPath, s.requireSession(s.linkCallback))
 	mux.HandleFunc("GET /t/{slug}/api/links/{token}", s.requireSession(s.linkFinalize))
 
+	// 可恢复认证尝试：恢复入口（cookie 或 body 提供恢复令牌）与状态查询。
+	mux.HandleFunc("GET /oauth/recover", s.optionalSession(s.recoverStart))
+	mux.HandleFunc("POST /oauth/recover", s.optionalSession(s.recoverStart))
+	mux.HandleFunc("GET /oauth/attempt", s.optionalSession(s.attemptStatus))
+	mux.HandleFunc("POST /oauth/attempt", s.optionalSession(s.attemptStatus))
+
 	// 受保护的业务接口
 	mux.HandleFunc("GET /t/{slug}/api/me", s.requireSession(s.me))
 	mux.HandleFunc("POST /t/{slug}/api/logout", s.requireSession(s.logout))
@@ -77,8 +85,9 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 // ---------- 会话中间件 ----------
 
 type authedContext struct {
-	session *models.Session
-	member  *models.Member
+	session    *models.Session
+	member     *models.Member
+	tenantSlug string
 }
 
 // requireSession 解析不透明会话 Cookie（数据库存的是哈希），
@@ -107,7 +116,7 @@ func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 			writeAPIError(w, authn("member no longer exists"))
 			return
 		}
-		ac := &authedContext{session: sess, member: member}
+		ac := &authedContext{session: sess, member: member, tenantSlug: tenant.Slug}
 		ctx := context.WithValue(r.Context(), ctxSession, ac)
 		next(w, r.WithContext(ctx))
 	}
@@ -115,6 +124,46 @@ func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 
 func authed(r *http.Request) *authedContext {
 	return r.Context().Value(ctxSession).(*authedContext)
+}
+
+// optionalSession 与会话中间件相同，但没有有效会话时不拦截 —— 普通登录的
+// 恢复入口本来就没有会话；处理器内部对链接意图自行强制会话一致。
+func (s *Server) optionalSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, err := r.Cookie(sessionCookie)
+		if err != nil || c.Value == "" {
+			next(w, r)
+			return
+		}
+		sess, err := s.store.SessionByHash(r.Context(), auth.HashToken(c.Value))
+		if err != nil {
+			// 恢复流程不依赖会话有效性本身（链接场景在 store 里逐字节比对
+			// 发起会话 id）；登录场景则无会话绑定。
+			next(w, r)
+			return
+		}
+		tenant, err := s.store.TenantByID(r.Context(), sess.TenantID)
+		if err != nil {
+			next(w, r)
+			return
+		}
+		member, err := s.store.Member(r.Context(), sess.TenantID, sess.MemberID)
+		if err != nil {
+			next(w, r)
+			return
+		}
+		ac := &authedContext{session: sess, member: member, tenantSlug: tenant.Slug}
+		ctx := context.WithValue(r.Context(), ctxSession, ac)
+		next(w, r.WithContext(ctx))
+	}
+}
+
+// maybeAuthed 返回当前会话（若存在且有效）。
+func maybeAuthed(r *http.Request) *authedContext {
+	if v := r.Context().Value(ctxSession); v != nil {
+		return v.(*authedContext)
+	}
+	return nil
 }
 
 // ---------- 日志（不记录任何凭据/令牌） ----------

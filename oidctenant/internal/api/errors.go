@@ -20,6 +20,11 @@ const (
 	ErrInvalidRequest ErrorType = "invalid_request"
 	// ErrReauthRequired 关联账号时身份未在规定时间内重新认证。
 	ErrReauthRequired ErrorType = "reauthentication_required"
+	// ErrProviderTemporarilyUnavailable 提供方暂时性错误（网络/5xx/429/发现不可达），
+	// 响应中带可操作但不泄密的恢复入口；只有该类失败允许派生全新请求。
+	ErrProviderTemporarilyUnavailable ErrorType = "provider_temporarily_unavailable"
+	// ErrRecoveryUnavailable 恢复入口对应意图已过期、终态或重试次数耗尽。
+	ErrRecoveryUnavailable ErrorType = "recovery_unavailable"
 )
 
 // APIError 携带 HTTP 状态、稳定错误码与可展示的简短描述。
@@ -54,6 +59,14 @@ func badRequest(msg string) *APIError {
 
 func reauthRequired(msg string) *APIError {
 	return newAPIError(http.StatusUnauthorized, ErrReauthRequired, msg)
+}
+
+func temporarilyUnavailable(msg string) *APIError {
+	return newAPIError(http.StatusServiceUnavailable, ErrProviderTemporarilyUnavailable, msg)
+}
+
+func recoveryUnavailable(msg string) *APIError {
+	return newAPIError(http.StatusGone, ErrRecoveryUnavailable, msg)
 }
 
 func asAPIError(err error) (*APIError, bool) {

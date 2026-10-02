@@ -1,12 +1,12 @@
 package api
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/oauth2"
 
 	sec "github.com/example/oidctenant/internal/auth"
@@ -25,11 +25,13 @@ type linkStartRequest struct {
 // POST /t/{slug}/api/links
 // body: {"issuer": "<target issuer>", "anchor_issuer": "<current issuer>"}
 //
-// 返回 201 + {"link_token": "...", "link_url": "..."}，调用方让浏览器跳转 link_url。
-// 两个身份各自重新认证：
+// 返回 201 + {"link_token": "...", "link_url": "...", "recovery_token": "..."}，
+// 调用方让浏览器跳转 link_url。两个身份各自重新认证：
 //   - A（当前会话身份）：linkStart 时刻记录 a_auth_time，完成时校验仍在强认证窗口内；
 //   - B（目标 IdP 身份）：授权请求强制 prompt=login,max_age=0，
 //     回调核对 IdP 返回的 auth_time 必须足够新。
+//
+// 关联会话、认证意图、首个 leg B 具体请求与 b_state 绑定在单事务内落库。
 func (s *Server) linkStart(w http.ResponseWriter, r *http.Request) {
 	ac := authed(r)
 	var req linkStartRequest
@@ -90,23 +92,11 @@ func (s *Server) linkStart(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "link token failed"))
 		return
 	}
-
-	// A 的重新认证锚点为当前会话的时刻；CompleteLink 用 maxAge 复核新鲜度。
-	ls := &models.LinkSession{
-		Token:          linkTok,
-		TenantID:       tenant.ID,
-		AnchorMemberID: ac.member.ID,
-		SessionID:      ac.session.ID,
-		TargetIDPID:    targetProv.ID,
-		AIssuer:        anchor.Issuer,
-		ASubject:       anchor.Subject,
-	}
-	ls.AAuthTime = sql.NullTime{Time: s.now(), Valid: true}
-	if err := s.store.CreateLinkSession(r.Context(), ls, s.cfg.LinkTTL); err != nil {
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "create link session failed"))
+	recoveryToken, err := sec.LinkToken()
+	if err != nil {
+		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "recovery token failed"))
 		return
 	}
-
 	state, err := sec.State()
 	if err != nil {
 		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "state failed"))
@@ -123,29 +113,39 @@ func (s *Server) linkStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sessionID := ac.session.ID
-	if err := s.store.CreateAuthRequest(r.Context(), &models.AuthRequest{
-		State:        state,
-		Kind:         "link_b",
-		TenantID:     tenant.ID,
-		IDPID:        targetProv.ID,
-		Nonce:        nonce,
-		PKCEVerifier: verifier,
-		ReturnTo:     "/",
-		LinkToken:    nullString(linkTok),
-		SessionID:    &sessionID,
-	}); err != nil {
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "persist auth request failed"))
+
+	// 单事务：关联会话（含 leg A 锚点）+ 认证意图 + leg B 首个具体请求。
+	attempt, err := s.store.CreateLinkAttempt(r.Context(), &store.LinkAttemptInput{
+		Attempt: store.CreateAttemptInput{
+			ID:                uuid.New(),
+			Kind:              "link_b",
+			TenantID:          tenant.ID,
+			IDPID:             targetProv.ID,
+			ReturnTo:          "/",
+			LinkToken:         linkTok,
+			SessionID:         &sessionID,
+			RecoveryTokenHash: sec.HashToken(recoveryToken),
+			State:             state,
+			Nonce:             nonce,
+			PKCEVerifier:      verifier,
+		},
+		AnchorMemberID: ac.member.ID,
+		TargetIDPID:    targetProv.ID,
+		AIssuer:        anchor.Issuer,
+		ASubject:       anchor.Subject,
+		AAuthTime:      s.now(),
+		LinkTTL:        s.cfg.LinkTTL,
+	}, s.cfg.AuthRequestTTL, s.cfg.MaxAuthAttempts)
+	if err != nil {
+		s.logger.Printf("create link attempt failed: %v", err)
+		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "create link session failed"))
 		return
 	}
-	// 把 leg B 的 state 绑定在 link session 上，回调必须与之一致。
-	if err := s.store.SetLinkLegBState(r.Context(), linkTok, state); err != nil {
-		writeAPIError(w, conflict("link session is not in a usable state"))
-		return
-	}
+	s.setAttemptCookie(w, recoveryToken)
 
 	cfg, err := s.oidc.OAuth2Config(r.Context(), targetProv, redirectURI)
 	if err != nil {
-		writeAPIError(w, authn("failed to initialize provider configuration"))
+		s.handleDiscoveryFailure(w, r, attempt, recoveryToken, err)
 		return
 	}
 	challenge := oauth2.S256ChallengeFromVerifier(verifier)
@@ -154,29 +154,42 @@ func (s *Server) linkStart(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]string{
-		"link_token": linkTok,
-		"link_url":   linkURL,
+		"link_token":     linkTok,
+		"link_url":       linkURL,
+		"recovery_token": recoveryToken,
 	})
 }
 
 // GET /oauth/link/callback?state=...&code=...
 //
 // 完成 B 身份的强制重新认证与全套校验，随后原子完成关联。
-// state 与 link token 都是一次性的：任何重放都在消费环节被拒绝。
+// 防重放/防回退层次（与登录一致）：
+//   - state 一次性消费；恢复后的旧 state 已 invalidated，与未知 state 行为一致；
+//   - 意图必须仍 pending，且与发起会话/成员/租户/目标 provider 一致；
+//   - 暂时性提供方错误才允许恢复（恢复时关联会话与 b_state 原子改绑新请求）；
+//   - 关联成功先条件终态化意图，再做一次性 link token 消费。
 func (s *Server) linkCallback(w http.ResponseWriter, r *http.Request) {
 	ac := authed(r)
 	state := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
+	if ep := r.URL.Query().Get("error"); ep != "" {
+		// IdP 终止了授权（终态）：可识别 state 时顺手终态化意图，不给恢复入口。
+		if state != "" {
+			if ar, cerr := s.store.ConsumeAuthRequest(r.Context(), state); cerr == nil {
+				_ = s.store.RecordAttemptPermanentFailure(r.Context(), ar.AttemptID,
+					"provider_error:"+sanitizeErrParam(ep))
+			}
+		}
+		s.clearAttemptCookie(w)
+		writeAPIError(w, authn("provider returned error: "+sanitizeErrParam(ep)))
+		return
+	}
 	if state == "" || code == "" {
 		writeAPIError(w, badRequest("missing state or code"))
 		return
 	}
-	if ep := r.URL.Query().Get("error"); ep != "" {
-		writeAPIError(w, authn("provider returned error: "+sanitizeErrParam(ep)))
-		return
-	}
 
-	// 原子消费 state（防重放；未知 state 与已消费 state 行为一致）。
+	// 原子消费 state（防重放；未知/已消费/已失效 state 行为一致）。
 	ar, err := s.store.ConsumeAuthRequest(r.Context(), state)
 	if err != nil {
 		writeAPIError(w, badRequest("link authorization request is unknown or already used"))
@@ -184,6 +197,12 @@ func (s *Server) linkCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if ar.Kind != "link_b" || !ar.LinkToken.Valid {
 		writeAPIError(w, badRequest("state is not valid for account linking"))
+		return
+	}
+	rawRecovery := recoveryCookieValue(r)
+	attempt, err := s.store.AttemptMustBePending(r.Context(), ar.AttemptID)
+	if err != nil {
+		writeAPIError(w, badRequest("link authorization request is unknown or already used"))
 		return
 	}
 	// 必须用发起关联时的同一个会话、同一个租户完成。
@@ -198,79 +217,95 @@ func (s *Server) linkCallback(w http.ResponseWriter, r *http.Request) {
 
 	ls, err := s.store.LinkSession(r.Context(), ar.LinkToken.String)
 	if err != nil {
+		s.terminalizePolicyFailure(r, attempt, "link_gone")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, conflict("link session not found or already used"))
 		return
 	}
 	if ls.Status != "pending" {
+		// 已完成/已消费：终态不回退。
+		s.terminalizePolicyFailure(r, attempt, "link_status")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, conflict("link session already completed or consumed"))
 		return
 	}
+	if !ls.ExpiresAt.After(s.now()) {
+		// 过期关联绝不重新打开。
+		_ = s.store.RecordAttemptPermanentFailure(r.Context(), attempt.ID, "link_expired")
+		s.clearAttemptCookie(w)
+		writeAPIError(w, s.mapLinkError(store.ErrNotFound))
+		return
+	}
 	if ls.AnchorMemberID != ac.member.ID {
+		s.terminalizePolicyFailure(r, attempt, "link_member")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, tenantForbidden("link session belongs to another member"))
 		return
 	}
 	if ls.TargetIDPID != ar.IDPID {
+		s.terminalizePolicyFailure(r, attempt, "link_idp")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, badRequest("state was issued for a different target provider"))
 		return
 	}
 
-	prov, err := s.store.ProviderByID(r.Context(), ar.TenantID, ar.IDPID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeAPIError(w, tenantForbidden("provider is no longer authorized for the tenant"))
-			return
-		}
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "lookup provider failed"))
-		return
-	}
-	if !prov.Enabled {
-		writeAPIError(w, tenantForbidden("identity provider is disabled for the tenant"))
+	prov, aerr := s.callbackProvider(w, r, attempt, ar.TenantID, ar.IDPID)
+	if aerr != nil {
+		writeAPIError(w, aerr)
 		return
 	}
 	redirectURI := s.redirectURLLink()
 	if !sec.RedirectURIAllowed(prov.RedirectURIs, redirectURI) {
+		s.terminalizePolicyFailure(r, attempt, "redirect_not_allowed")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, badRequest("callback url is not registered for this provider"))
 		return
 	}
 
-	cfg, err := s.oidc.OAuth2Config(r.Context(), prov, redirectURI)
-	if err != nil {
-		writeAPIError(w, authn("failed to initialize provider configuration"))
+	cfg, ver, derr := s.buildOIDC(r.Context(), prov, redirectURI, ar.Nonce)
+	if derr != nil {
+		s.handleDiscoveryFailure(w, r, attempt, rawRecovery, derr)
 		return
 	}
-	ver, err := s.oidc.Verifier(r.Context(), prov, ar.Nonce)
-	if err != nil {
-		writeAPIError(w, authn("failed to initialize token verifier"))
-		return
-	}
-	claims, _, err := s.oidc.ExchangeAndVerify(r.Context(), prov, cfg, ver, code, ar.PKCEVerifier)
-	if err != nil {
-		s.logVerifyFailure(err)
-		writeAPIError(w, authn("token exchange or id token verification failed"))
+	claims, _, xerr := s.oidc.ExchangeAndVerify(r.Context(), prov, cfg, ver, code, ar.PKCEVerifier)
+	if xerr != nil {
+		s.classifyAttemptFailure(w, r, attempt, rawRecovery, xerr)
 		return
 	}
 
 	// B 身份必须来自声明的 issuer，且在 provider 窗口内交互式重新认证过。
 	if claims.Issuer != prov.Issuer {
+		s.terminalizePolicyFailure(r, attempt, "issuer_mismatch")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, authn("id token issuer does not match the configured provider"))
 		return
 	}
 	maxAge := providerAuthMaxAge(prov)
 	bAuthTime := claims.AuthTime
 	if bAuthTime.IsZero() {
+		// IdP 无法证明 auth_time：协议缺陷，永久不可恢复（重新发起链接）。
+		_ = s.store.RecordAttemptPermanentFailure(r.Context(), attempt.ID, "no_auth_time")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, reauthRequired(
 			"provider did not report auth_time; cannot prove recent re-authentication"))
 		return
 	}
 	if s.now().Sub(bAuthTime) > maxAge {
+		// 重新认证不够新鲜：恢复会再次强制 prompt=login，但同一已完成 B 认证
+		// 不能被重试；这里属于策略永久失败，需重新发起。
+		_ = s.store.RecordAttemptPermanentFailure(r.Context(), attempt.ID, "stale_auth_time")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, reauthRequired("second identity authentication is stale; re-authenticate"))
 		return
 	}
 
-	// 原子写入 B leg（state 必须与创建时绑定值一致，防止替换/重放）。
+	// 原子写入 B leg（state 必须与创建/恢复时绑定值一致，防止替换/重放）。
 	if err := s.store.AttachLinkLegB(r.Context(), ls.Token, state,
 		claims.Issuer, claims.Subject, claims.Email, bAuthTime, prov.ID); err != nil {
 		if errors.Is(err, store.ErrConflict) {
+			// 重复/乱序回调：尝试已可能被并发成功，按终态不回退处理。
+			s.terminalizePolicyFailure(r, attempt, "leg_b_conflict")
+			s.clearAttemptCookie(w)
 			writeAPIError(w, conflict("link leg has already been recorded"))
 			return
 		}
@@ -280,11 +315,19 @@ func (s *Server) linkCallback(w http.ResponseWriter, r *http.Request) {
 
 	// 原子完成全部冲突检查与绑定；link token 随即消费，杜绝重放。
 	if err := s.store.CompleteLink(r.Context(), ls.Token, s.now(), maxAge); err != nil {
+		s.terminalizePolicyFailure(r, attempt, "complete_conflict")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, s.mapLinkError(err))
 		return
 	}
 	if err := s.store.ConsumeCompletedLink(r.Context(), ls.Token); err != nil {
+		s.terminalizePolicyFailure(r, attempt, "consume_link")
+		s.clearAttemptCookie(w)
 		writeAPIError(w, conflict("link completed but the one-time token could not be consumed"))
+		return
+	}
+	// 全部写入完成后才终态化意图；条件更新保证并发的迟到回调不能再影响结果。
+	if !s.finishAttemptSuccess(w, r, attempt) {
 		return
 	}
 
@@ -336,8 +379,4 @@ func providerAuthMaxAge(p *models.Provider) time.Duration {
 		secs = 300
 	}
 	return time.Duration(secs) * time.Second
-}
-
-func nullString(v string) sql.NullString {
-	return sql.NullString{String: v, Valid: v != ""}
 }

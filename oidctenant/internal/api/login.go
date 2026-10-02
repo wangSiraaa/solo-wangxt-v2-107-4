@@ -62,6 +62,9 @@ func safeReturnTo(v string) string {
 }
 
 // GET /t/{slug}/login?issuer=...&return_to=/...
+//
+// 这里同时持久化“用户意图（auth_attempt）”与“首个具体 OIDC 请求
+// （state/nonce/PKCE）”。意图在后续暂时性失败后仍可用，具体请求一次性。
 func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	issuer := r.URL.Query().Get("issuer")
@@ -78,34 +81,28 @@ func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := sec.State()
-	if err != nil {
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "state generation failed"))
+	secr, ok := s.generateAttemptSecrets(w)
+	if !ok {
 		return
 	}
-	nonce, err := sec.Nonce()
-	if err != nil {
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "nonce generation failed"))
-		return
-	}
-	verifier, err := sec.PKCEVerifier()
-	if err != nil {
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "pkce generation failed"))
-		return
-	}
-
 	returnTo := safeReturnTo(r.URL.Query().Get("return_to"))
-	if err := s.store.CreateAuthRequest(r.Context(), &models.AuthRequest{
-		State:        state,
-		Kind:         "login",
-		TenantID:     tenant.ID,
-		IDPID:        prov.ID,
-		Nonce:        nonce,
-		PKCEVerifier: verifier,
-		ReturnTo:     returnTo,
-	}); err != nil {
-		s.logger.Printf("persist auth request failed: %v", err)
-		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "persist auth request failed"))
+	attempt := &models.AuthAttempt{
+		ID:         secr.id,
+		Token:      secr.token,
+		Kind:       "login",
+		TenantID:   tenant.ID,
+		IDPID:      prov.ID,
+		ReturnTo:   returnTo,
+		MaxRetries: s.cfg.AttemptMaxRetries,
+	}
+	ar := &models.AuthRequest{
+		State:        secr.state,
+		Nonce:        secr.nonce,
+		PKCEVerifier: secr.verifier,
+	}
+	if err := s.store.CreateAuthAttemptWithRequest(r.Context(), attempt, ar, s.cfg.AuthRequestTTL); err != nil {
+		s.logger.Printf("persist auth attempt failed: %v", err)
+		writeAPIError(w, newAPIError(http.StatusInternalServerError, "internal_error", "persist auth attempt failed"))
 		return
 	}
 
@@ -115,15 +112,103 @@ func (s *Server) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, authn("failed to initialize provider configuration"))
 		return
 	}
-	challenge := oauth2.S256ChallengeFromVerifier(verifier)
-	authURL := oidcx.AuthCodeURL(cfg, state, nonce, challenge, "S256", false, nil)
+
+	s.setAttemptCookie(w, attempt.Token)
+	http.Redirect(w, r, buildAuthURL(cfg, secr, false), http.StatusFound)
+}
+
+// GET /oauth/resume?attempt=...
+//
+// 安全重试入口：只有上一代次失败被明确分类为“暂时性提供方错误”时，
+// store 才会在事务里作废旧请求并创建全新 state/nonce/PKCE。
+// 重复点击在新代次未消费时幂等复用同一后继请求（只产生一个有效后继）。
+func (s *Server) loginResume(w http.ResponseWriter, r *http.Request) {
+	// 恢复后会 302 到外部 IdP：不向外发送 Referer，避免恢复令牌经 Referer 泄露。
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	token := attemptTokenFromRequest(r)
+	a, ae := s.loadAttemptForResume(r, token, false)
+	if ae != nil {
+		writeAPIError(w, ae)
+		return
+	}
+	prov, ae := s.resumeProvider(r, a)
+	if ae != nil {
+		writeAPIError(w, ae)
+		return
+	}
+	res, authURL, ae := s.performResume(w, r, prov, s.redirectURLLogin(), false)
+	if ae != nil {
+		writeAPIError(w, ae)
+		return
+	}
+	if res == nil {
+		return // performResume 已直接写响应（如发现阶段再次暂时失败）
+	}
 	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// loadAttemptForResume 按令牌加载意图并做场景归属校验，不泄露存在性。
+// requireSession=true 用于关联意图（必须同会话）；登录意图必须无会话绑定。
+func (s *Server) loadAttemptForResume(r *http.Request, token string, requireSession bool) (
+	*models.AuthAttempt, *APIError) {
+	if token == "" {
+		return nil, badRequest("missing attempt token")
+	}
+	a, err := s.store.AuthAttemptByToken(r.Context(), token)
+	if err != nil {
+		return nil, attemptGone("the authentication attempt is no longer available")
+	}
+	switch {
+	case a.Status == "expired" || a.ExpiresAt.Before(s.now()):
+		return nil, attemptGone("the authentication attempt has expired; please start over")
+	case a.Status != "pending":
+		return nil, attemptGone("the authentication attempt cannot be resumed")
+	case a.LastFailureAt.Valid && !a.LastFailureRecoverable:
+		// 最近一次是永久失败：恢复入口无效。
+		return nil, attemptGone("the authentication attempt cannot be resumed")
+	}
+	if requireSession {
+		ac := authed(r)
+		if a.Kind != "link_b" || a.SessionID == nil || *a.SessionID != ac.session.ID ||
+			a.TenantID != ac.session.TenantID {
+			return nil, attemptGone("the authentication attempt is no longer available")
+		}
+	} else {
+		if a.Kind != "login" || a.SessionID != nil {
+			return nil, attemptGone("the authentication attempt is no longer available")
+		}
+	}
+	return a, nil
+}
+
+// resumeProvider 按意图记录的 idp 重新解析提供方（恢复仍绑定原租户与 IdP），
+// 并校验 IdP 仍被授权、回调地址仍在白名单。
+func (s *Server) resumeProvider(r *http.Request, a *models.AuthAttempt) (*models.Provider, *APIError) {
+	prov, err := s.store.ProviderByID(r.Context(), a.TenantID, a.IDPID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, tenantForbidden("provider is no longer authorized for the tenant")
+		}
+		return nil, newAPIError(http.StatusInternalServerError, "internal_error", "lookup provider failed")
+	}
+	if !prov.Enabled {
+		return nil, tenantForbidden("identity provider is disabled for the tenant")
+	}
+	redirectURI := s.redirectURLLogin()
+	if a.Kind == "link_b" {
+		redirectURI = s.redirectURLLink()
+	}
+	if !sec.RedirectURIAllowed(prov.RedirectURIs, redirectURI) {
+		return nil, badRequest("callback url is not registered for this provider")
+	}
+	return prov, nil
 }
 
 // GET /oauth/callback?state=...&code=...
 //
 // 重复到达（同一 state 两次）在 ConsumeAuthRequest 处被原子拦截，
-// 因此第二个回调绝不会再走“找到/创建成员”，也就不可能创建多个成员。
+// 旧代次迟到回调同样在消费/意图状态检查处被拒绝，因此任何迟到回调
+// 都不可能再走“找到/创建成员”，也就不可能创建多个成员或使已完成流程回退。
 func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	state := q.Get("state")
@@ -133,12 +218,13 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errParam := q.Get("error"); errParam != "" {
-		// IdP 返回的错误码本身不含敏感材料，但描述可能不可信，仅回传错误码。
-		writeAPIError(w, authn("provider returned error: "+sanitizeErrParam(errParam)))
+		// IdP 在回调里直接报错：消费 state 防重放后按协议分类
+		// （server_error/temporarily_unavailable 可恢复，其余永久失败）。
+		s.consumeAndFailCallback(w, r, state, false, s.redirectURLLogin())
 		return
 	}
 
-	// 原子取出并消费 state：伪造 state 与重放回调得到同样结果。
+	// 原子取出并消费 state：伪造、重放、旧代次、已终结意图得到同样结果。
 	ar, err := s.store.ConsumeAuthRequest(r.Context(), state)
 	if err != nil {
 		writeAPIError(w, badRequest("authorization request is unknown or has already been used"))
@@ -146,6 +232,11 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	if ar.Kind != "login" {
 		writeAPIError(w, badRequest("state is not valid for the login callback"))
+		return
+	}
+	if ar.AttemptID == nil {
+		// 不属于任何意图的遗留行：拒绝（迁移后不应出现）。
+		writeAPIError(w, badRequest("authorization request is unknown or has already been used"))
 		return
 	}
 
@@ -169,25 +260,25 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := s.oidc.OAuth2Config(r.Context(), prov, redirectURI)
-	if err != nil {
-		s.logger.Printf("oidc config error: %v", err)
-		writeAPIError(w, authn("failed to initialize provider configuration"))
-		return
-	}
-	ver, err := s.oidc.Verifier(r.Context(), prov, ar.Nonce)
-	if err != nil {
-		s.logger.Printf("oidc verifier error: %v", err)
-		writeAPIError(w, authn("failed to initialize token verifier"))
+	cfg, ver, cae := s.oauthConfigAndVerifier(r, prov, redirectURI, ar.Nonce)
+	if cae != nil {
+		// 发现失败：暂时性可恢复，永久则失败。
+		s.writeProviderFailure(w, r, ar, cae.cause, false, redirectURI)
 		return
 	}
 
 	// 令牌交换 + 签名/受众/issuer/过期/nonce/PKCE 校验。
-	// 授权码重放、PKCE 不匹配会在这里失败（state 已消费，不可再试）。
+	// 授权码重放、PKCE 不匹配在这里被判为永久失败（不可恢复）。
 	claims, _, err := s.oidc.ExchangeAndVerify(r.Context(), prov, cfg, ver, code, ar.PKCEVerifier)
 	if err != nil {
-		s.logVerifyFailure(err)
-		writeAPIError(w, authn("token exchange or id token verification failed"))
+		s.writeProviderFailure(w, r, ar, err, false, redirectURI)
+		return
+	}
+
+	// 先抢占意图终态：并发的旧/新回调只有一个能越过这里，杜绝重复建成员/会话。
+	if err := s.store.MarkAuthAttemptSucceeded(r.Context(), *ar.AttemptID); err != nil {
+		s.logger.Printf("mark attempt succeeded failed: %v", err)
+		writeAPIError(w, badRequest("authorization request is unknown or has already been used"))
 		return
 	}
 
@@ -217,6 +308,7 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, token)
+	s.clearAttemptCookie(w)
 
 	target := ar.ReturnTo
 	if target == "" {
@@ -224,6 +316,54 @@ func (s *Server) loginCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Location", target)
 	w.WriteHeader(http.StatusFound)
+}
+
+// oauthConfigAndVerifier 同时准备 oauth2 配置与 ID token 校验器；
+// 发现失败时返回带 cause（已分类可恢复性）的 APIError。
+func (s *Server) oauthConfigAndVerifier(r *http.Request, prov *models.Provider,
+	redirectURI, nonce string) (*oauth2.Config, *oidcx.Verifier, *classifiedAPIError) {
+	cfg, err := s.oidc.OAuth2Config(r.Context(), prov, redirectURI)
+	if err != nil {
+		s.logger.Printf("oidc config error: %v", err)
+		return nil, nil, &classifiedAPIError{
+			APIError: authn("failed to initialize provider configuration"), cause: err,
+		}
+	}
+	ver, err := s.oidc.Verifier(r.Context(), prov, nonce)
+	if err != nil {
+		s.logger.Printf("oidc verifier error: %v", err)
+		return nil, nil, &classifiedAPIError{
+			APIError: authn("failed to initialize token verifier"), cause: err,
+		}
+	}
+	return cfg, ver, nil
+}
+
+type classifiedAPIError struct {
+	*APIError
+	cause error
+}
+
+// consumeAndFailCallback 处理“回调带 error 参数”等不进入令牌交换的失败：
+// 先消费 state（一次性），再按协议把失败分类持久化到意图，
+// 只有 server_error / temporarily_unavailable 提供恢复入口。
+func (s *Server) consumeAndFailCallback(w http.ResponseWriter, r *http.Request, state string,
+	forceLogin bool, redirectURI string) {
+	ar, err := s.store.ConsumeAuthRequest(r.Context(), state)
+	if err != nil {
+		writeAPIError(w, badRequest("authorization request is unknown or has already been used"))
+		return
+	}
+	ep := r.URL.Query().Get("error")
+	var cause error
+	if ep == "server_error" || ep == "temporarily_unavailable" {
+		cause = oidcx.NewProviderUnavailable("provider reported a temporary error")
+	} else {
+		// access_denied / invalid_request 等协议层永久失败。
+		cause = oidcx.NewVerifyError(oidcx.KindClaims,
+			"provider returned error: "+sanitizeErrParam(ep))
+	}
+	s.writeProviderFailure(w, r, ar, cause, forceLogin, redirectURI)
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
@@ -242,7 +382,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
 func (s *Server) logVerifyFailure(err error) {
 	if ve, ok := oidcx.AsVerifyError(err); ok {
 		// 只记录分类，不记录令牌或授权码。
-		s.logger.Printf("oidc verification failed: kind=%s", ve.Kind)
+		s.logger.Printf("oidc verification failed: kind=%s recoverable=%t", ve.Kind, ve.Recoverable)
 		return
 	}
 	s.logger.Printf("oidc verification failed (untyped)")

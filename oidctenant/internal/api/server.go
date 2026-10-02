@@ -57,10 +57,15 @@ func (s *Server) Routes() http.Handler {
 	// 登录
 	mux.HandleFunc("GET /t/{slug}/login", s.loginStart)
 	mux.HandleFunc("GET "+callbackPath, s.loginCallback)
+	// 可恢复认证尝试：安全重试入口与粗粒度状态查询。
+	mux.HandleFunc("GET "+loginResumePath, s.loginResume)
+	mux.HandleFunc("GET "+attemptStatusPath, s.loginAttemptStatus)
 
 	// 账号关联
 	mux.HandleFunc("POST /t/{slug}/api/links", s.requireSession(s.linkStart))
 	mux.HandleFunc("GET "+linkCBPath, s.requireSession(s.linkCallback))
+	mux.HandleFunc("GET "+linkResumePath, s.requireSession(s.linkResume))
+	mux.HandleFunc("GET /oauth/link/attempt", s.requireSession(s.linkAttemptStatus))
 	mux.HandleFunc("GET /t/{slug}/api/links/{token}", s.requireSession(s.linkFinalize))
 
 	// 受保护的业务接口

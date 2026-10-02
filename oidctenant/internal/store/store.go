@@ -23,6 +23,10 @@ var (
 	ErrConsumed = errors.New("store: auth request already consumed or unknown")
 	// ErrConflict 表示唯一约束冲突（绑定冲突）。
 	ErrConflict = errors.New("store: unique constraint violation")
+	// ErrExpired 表示认证意图（或关联会话）已超过 TTL，恢复入口不能重新打开它。
+	ErrExpired = errors.New("store: auth attempt expired")
+	// ErrExhausted 表示认证意图的最大恢复次数已用尽。
+	ErrExhausted = errors.New("store: auth attempt retries exhausted")
 )
 
 type Store struct {
@@ -123,20 +127,314 @@ func (s *Store) UpsertProvider(ctx context.Context, p *models.Provider) error {
 	return err
 }
 
-// ---------- auth requests ----------
+// ---------- auth attempts（用户意图）与 auth requests（每次具体 OIDC 请求） ----------
 
-func (s *Store) CreateAuthRequest(ctx context.Context, ar *models.AuthRequest) error {
-	_, err := s.pool.Exec(ctx,
+// CreateAuthAttemptWithRequest 在单个事务里建立一次认证意图与其首个具体请求
+// （state/nonce/PKCE）。意图与请求同时可见，任何中途失败整体回滚。
+func (s *Store) CreateAuthAttemptWithRequest(ctx context.Context,
+	a *models.AuthAttempt, ar *models.AuthRequest, ttl time.Duration) error {
+
+	now := time.Now()
+	a.CreatedAt = now
+	a.ExpiresAt = now.Add(ttl)
+	if a.Status == "" {
+		a.Status = "pending"
+	}
+	if a.RequestSeq == 0 {
+		a.RequestSeq = 1
+	}
+	ar.AttemptID = &a.ID
+	ar.RequestSeq = a.RequestSeq
+	ar.Kind = a.Kind
+	ar.TenantID = a.TenantID
+	ar.IDPID = a.IDPID
+	ar.ReturnTo = a.ReturnTo
+	ar.LinkToken = a.LinkToken
+	ar.SessionID = a.SessionID
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO auth_attempts
+		 (id, token, kind, tenant_id, idp_id, return_to, link_token, session_id,
+		  status, request_seq, max_retries, expires_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		a.ID, a.Token, a.Kind, a.TenantID, a.IDPID, a.ReturnTo,
+		nullableStr(a.LinkToken), a.SessionID,
+		a.Status, a.RequestSeq, a.MaxRetries, a.ExpiresAt); err != nil {
+		return mapErr(err)
+	}
+	if err := insertAuthRequest(ctx, tx, ar); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func insertAuthRequest(ctx context.Context, tx pgx.Tx, ar *models.AuthRequest) error {
+	_, err := tx.Exec(ctx,
 		`INSERT INTO auth_requests
-		 (state, kind, tenant_id, idp_id, nonce, pkce_verifier, return_to, link_token, session_id)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		 (state, kind, tenant_id, idp_id, nonce, pkce_verifier, return_to,
+		  link_token, session_id, attempt_id, request_seq)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		ar.State, ar.Kind, ar.TenantID, ar.IDPID, ar.Nonce, ar.PKCEVerifier,
-		ar.ReturnTo, nullableStr(ar.LinkToken), ar.SessionID)
+		ar.ReturnTo, nullableStr(ar.LinkToken), ar.SessionID,
+		ar.AttemptID, ar.RequestSeq)
 	return mapErr(err)
 }
 
+// AuthAttemptByToken 按不透明恢复令牌查找认证意图。不存在即返回 ErrNotFound，
+// 使调用方无法借此枚举有效令牌。
+func (s *Store) AuthAttemptByToken(ctx context.Context, token string) (*models.AuthAttempt, error) {
+	return s.authAttempt(ctx, `WHERE token = $1`, token)
+}
+
+func (s *Store) authAttempt(ctx context.Context, where string, args ...any) (*models.AuthAttempt, error) {
+	var a models.AuthAttempt
+	q := attemptSelectCols + `
+	      FROM auth_attempts ` + where
+	err := s.pool.QueryRow(ctx, q, args...).Scan(attemptScanArgs(&a)...)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return &a, nil
+}
+
+// attemptColumns 是 auth_attempts 的完整读取列（SELECT 与 RETURNING 共用）。
+const attemptColumns = `id, token, kind, tenant_id, idp_id, return_to, link_token, session_id,
+        status, request_seq, max_retries,
+        last_failure_kind, last_failure_recoverable, last_failure_at, failed_request_seq,
+        created_at, expires_at, finished_at`
+
+// attemptSelectCols / attemptScanArgs 统一 attempt 行的读取，避免多处列顺序漂移。
+const attemptSelectCols = `SELECT ` + attemptColumns
+
+func attemptScanArgs(a *models.AuthAttempt) []any {
+	return []any{
+		&a.ID, &a.Token, &a.Kind, &a.TenantID, &a.IDPID, &a.ReturnTo,
+		&a.LinkToken, &a.SessionID, &a.Status, &a.RequestSeq, &a.MaxRetries,
+		&a.LastFailureKind, &a.LastFailureRecoverable, &a.LastFailureAt, &a.FailedRequestSeq,
+		&a.CreatedAt, &a.ExpiresAt, &a.FinishedAt,
+	}
+}
+
+const authRequestSelect = `SELECT state, kind, tenant_id, idp_id, nonce, pkce_verifier,
+	       return_to, link_token, session_id, created_at, attempt_id, request_seq
+	    `
+
+func authRequestScanArgs(ar *models.AuthRequest) []any {
+	return []any{
+		&ar.State, &ar.Kind, &ar.TenantID, &ar.IDPID, &ar.Nonce, &ar.PKCEVerifier,
+		&ar.ReturnTo, &ar.LinkToken, &ar.SessionID, &ar.CreatedAt,
+		&ar.AttemptID, &ar.RequestSeq,
+	}
+}
+
+// ResumeAuthAttempt 原子地为一次“可恢复失败”的意图创建下代次具体请求。
+//
+// 语义保证：
+//   - 只有 status=pending、未过期的意图可以恢复；过期/已完成/永久失败一律拒绝；
+//   - link_b 意图额外要求关联会话仍 pending、未过期，且其 b_attempt 仍指向本意图；
+//   - 已经存在未消费请求时（用户重复点击/刷新/重试）直接复用该请求，行不增加；
+//   - 否则旧代次全部永久失效，request_seq+1 后插入新请求；
+//   - 恢复次数超过 max_retries 时把意图置为 failed 并返回 ErrExhausted；
+//   - 同一意图上的并发恢复由行级 FOR UPDATE 串行化，叠加部分唯一索引兜底。
+func (s *Store) ResumeAuthAttempt(ctx context.Context, token string,
+	next *models.AuthRequest) (*models.AuthAttempt, *models.AuthRequest, error) {
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var a models.AuthAttempt
+	err = tx.QueryRow(ctx,
+		attemptSelectCols+` FROM auth_attempts WHERE token = $1 FOR UPDATE`, token,
+	).Scan(attemptScanArgs(&a)...)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrNotFound
+		}
+		return nil, nil, err
+	}
+
+	switch {
+	case a.Status == "expired", a.ExpiresAt.Before(time.Now()):
+		_, _ = tx.Exec(ctx,
+			`UPDATE auth_attempts SET status='expired', finished_at=now() WHERE id=$1`, a.ID)
+		if err := tx.Commit(ctx); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, ErrExpired
+	case a.Status != "pending":
+		// succeeded / failed：恢复入口不能重开。
+		return nil, nil, ErrConflict
+	}
+
+	if a.LinkToken.Valid {
+		// 关联场景：意图永远绑定原成员/租户/会话与未过期的关联上下文。
+		var linkStatus string
+		var linkExpiresAt time.Time
+		var bAttemptID uuid.NullUUID
+		err = tx.QueryRow(ctx,
+			`SELECT status, expires_at, b_attempt_id FROM link_sessions
+			 WHERE token = $1 FOR UPDATE`, a.LinkToken.String,
+		).Scan(&linkStatus, &linkExpiresAt, &bAttemptID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrNotFound
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		if linkStatus != "pending" || linkExpiresAt.Before(time.Now()) ||
+			!bAttemptID.Valid || bAttemptID.UUID != a.ID {
+			// 已过期/已完成的关联不能借恢复重新打开；意图不属于该关联也拒绝。
+			return nil, nil, ErrConflict
+		}
+	}
+
+	// 恢复的前提：上一代次确实记录过“可恢复失败”。没有失败记录（原请求还在途、
+	// 用户尚未完成与 IdP 的交互）时绝不铸造新请求，避免同一意图出现并行有效请求。
+	if a.FailedRequestSeq == 0 || !a.LastFailureRecoverable ||
+		!a.LastFailureAt.Valid {
+		return nil, nil, ErrConflict
+	}
+
+	// 幂等：最近失败代次之后已经铸造过新代次（重复点击恢复 / 刷新 / 重试），
+	// 直接复用那个仍未消费的后继请求，行不增加。
+	var existing models.AuthRequest
+	err = tx.QueryRow(ctx, authRequestSelect+`
+	     FROM auth_requests WHERE attempt_id = $1 AND consumed_at IS NULL`, a.ID,
+	).Scan(authRequestScanArgs(&existing)...)
+	switch {
+	case err == nil:
+		// 只有当该未消费请求确实晚于最近失败代次时才算后继；否则属于异常状态。
+		if existing.RequestSeq <= a.FailedRequestSeq {
+			return nil, nil, ErrConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, nil, err
+		}
+		return &a, &existing, nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return nil, nil, err
+	}
+
+	// 走到这里意味着失败代次已消费失效，且尚未铸造后继——现在铸造。
+	if a.RequestSeq-1 >= a.MaxRetries {
+		// request_seq-1 即已经发生的尝试次数；超过允许次数则终结意图。
+		if _, err := tx.Exec(ctx,
+			`UPDATE auth_attempts
+			 SET status='failed', finished_at=now(),
+			     last_failure_kind='retry_exhausted',
+			     last_failure_recoverable=false, last_failure_at=now()
+			 WHERE id=$1`, a.ID); err != nil {
+			return nil, nil, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, ErrExhausted
+	}
+
+	newSeq := a.RequestSeq + 1
+	next.AttemptID = &a.ID
+	next.RequestSeq = newSeq
+	next.Kind = a.Kind
+	next.TenantID = a.TenantID
+	next.IDPID = a.IDPID
+	next.ReturnTo = a.ReturnTo
+	next.LinkToken = a.LinkToken
+	next.SessionID = a.SessionID
+	if err := insertAuthRequest(ctx, tx, next); err != nil {
+		return nil, nil, err
+	}
+	// request_seq 推进到新代次；失败标记保留（FailedRequestSeq 指向上一代次），
+	// 因为新代次尚未消费，它不是一个“新的可恢复失败”，防止从新代次再次恢复。
+	if _, err := tx.Exec(ctx,
+		`UPDATE auth_attempts SET request_seq=$1 WHERE id=$2`,
+		newSeq, a.ID); err != nil {
+		return nil, nil, err
+	}
+	if a.LinkToken.Valid {
+		// 关联会话的 leg B state 同步切换到新代次；旧 state 不再被接受。
+		if _, err := tx.Exec(ctx,
+			`UPDATE link_sessions SET b_state=$1 WHERE token=$2 AND b_attempt_id=$3`,
+			next.State, a.LinkToken.String, a.ID); err != nil {
+			return nil, nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+	a.RequestSeq = newSeq
+	return &a, next, nil
+}
+
+// RecordAuthRequestFailure 在单个事务中把刚消费的具体请求标记为失败，
+// 同时把失败分类记录到意图。暂时性失败（recoverable=true）后意图仍 pending，
+// 等待恢复；永久失败把意图置为 failed，任何恢复入口都不能再打开它。
+func (s *Store) RecordAuthRequestFailure(ctx context.Context, attemptID uuid.UUID,
+	requestSeq int, kind string, recoverable bool) (*models.AuthAttempt, error) {
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE auth_requests SET failed_at=now(), failure_kind=$1
+		 WHERE attempt_id=$2 AND request_seq=$3`,
+		kind, attemptID, requestSeq); err != nil {
+		return nil, err
+	}
+
+	var a models.AuthAttempt
+	err = tx.QueryRow(ctx,
+		`UPDATE auth_attempts
+		 SET last_failure_kind=$1, last_failure_recoverable=$2, last_failure_at=now(),
+		     failed_request_seq=$4,
+		     status = CASE WHEN $2 THEN status ELSE 'failed' END,
+		     finished_at = CASE WHEN $2 THEN finished_at ELSE now() END
+		 WHERE id=$3
+		 RETURNING `+attemptColumns,
+		kind, recoverable, attemptID, requestSeq,
+	).Scan(attemptScanArgs(&a)...)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// MarkAuthAttemptSucceeded 把意图标记为完成。此后任何迟到回调（旧或新代次）都
+// 只能看到已消费/不存在的 state，恢复入口也拒绝重开。
+func (s *Store) MarkAuthAttemptSucceeded(ctx context.Context, attemptID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE auth_attempts SET status='succeeded', finished_at=now()
+		 WHERE id=$1 AND status='pending'`, attemptID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
 // ConsumeAuthRequest 原子地取出并消费一个 state。
-// 重复回调（已消费）或伪造 state 一律返回 ErrConsumed。
+// 重复回调（已消费）、伪造 state，或该 state 所属意图已经终结（成功/失败/过期）
+// 一律返回 ErrConsumed，避免通过接口区分“不存在”与“已终结”。
 func (s *Store) ConsumeAuthRequest(ctx context.Context, state string) (*models.AuthRequest, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -146,13 +444,15 @@ func (s *Store) ConsumeAuthRequest(ctx context.Context, state string) (*models.A
 
 	var ar models.AuthRequest
 	err = tx.QueryRow(ctx,
-		`SELECT state, kind, tenant_id, idp_id, nonce, pkce_verifier, return_to,
-		        link_token, session_id, created_at
-		 FROM auth_requests WHERE state = $1 AND consumed_at IS NULL
-		 FOR UPDATE`,
+		`SELECT ar.state, ar.kind, ar.tenant_id, ar.idp_id, ar.nonce, ar.pkce_verifier,
+		        ar.return_to, ar.link_token, ar.session_id, ar.created_at,
+		        ar.attempt_id, ar.request_seq
+		 FROM auth_requests ar
+		 JOIN auth_attempts aa ON aa.id = ar.attempt_id
+		 WHERE ar.state = $1 AND ar.consumed_at IS NULL AND aa.status = 'pending'
+		 FOR UPDATE OF ar`,
 		state,
-	).Scan(&ar.State, &ar.Kind, &ar.TenantID, &ar.IDPID, &ar.Nonce,
-		&ar.PKCEVerifier, &ar.ReturnTo, &ar.LinkToken, &ar.SessionID, &ar.CreatedAt)
+	).Scan(authRequestScanArgs(&ar)...)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrConsumed
@@ -169,10 +469,22 @@ func (s *Store) ConsumeAuthRequest(ctx context.Context, state string) (*models.A
 	return &ar, nil
 }
 
-// DeleteExpiredAuthRequests 清理过期未消费的 state 行。
+// DeleteExpiredAuthRequests 清理已终结/过期的具体请求与意图，防止表无限增长。
+// 过期但仍 pending 的意图先显式置为 expired，确保过期状态持久化、恢复入口关闭。
 func (s *Store) DeleteExpiredAuthRequests(ctx context.Context, before time.Time) error {
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE auth_attempts SET status='expired', finished_at=now()
+		 WHERE status='pending' AND expires_at < $1`, before); err != nil {
+		return err
+	}
+	if _, err := s.pool.Exec(ctx,
+		`DELETE FROM auth_requests WHERE created_at < $1`, before); err != nil {
+		return err
+	}
 	_, err := s.pool.Exec(ctx,
-		`DELETE FROM auth_requests WHERE created_at < $1`, before)
+		`DELETE FROM auth_attempts
+		 WHERE expires_at < $1
+		    OR (status <> 'pending' AND COALESCE(finished_at, created_at) < $1)`, before)
 	return err
 }
 
@@ -352,37 +664,97 @@ func (s *Store) RevokeSession(ctx context.Context, id uuid.UUID) error {
 
 // ---------- link sessions ----------
 
-// CreateLinkSession 建立待完成的关联会话。
-func (s *Store) CreateLinkSession(ctx context.Context, ls *models.LinkSession, ttl time.Duration) error {
-	ls.ExpiresAt = time.Now().Add(ttl)
-	_, err := s.pool.Exec(ctx,
+// CreateLinkSessionWithAttempt 在单个事务里原子建立：关联会话、leg B 的认证意图
+// （auth_attempts）与首个具体请求（auth_requests），并把 b_state / b_attempt_id
+// 绑定到首代次。三者要么同时可见，要么整体回滚。
+func (s *Store) CreateLinkSessionWithAttempt(ctx context.Context,
+	ls *models.LinkSession, a *models.AuthAttempt, ar *models.AuthRequest, ttl time.Duration) error {
+
+	now := time.Now()
+	ls.ExpiresAt = now.Add(ttl)
+	a.CreatedAt = now
+	a.ExpiresAt = now.Add(ttl)
+	if a.Status == "" {
+		a.Status = "pending"
+	}
+	if a.RequestSeq == 0 {
+		a.RequestSeq = 1
+	}
+	a.Kind = "link_b"
+	a.TenantID = ls.TenantID
+	a.IDPID = ls.TargetIDPID
+	a.ReturnTo = "/"
+	a.LinkToken = models.NullString{String: ls.Token, Valid: true}
+	a.SessionID = &ls.SessionID
+	ar.AttemptID = &a.ID
+	ar.RequestSeq = a.RequestSeq
+	ar.Kind = a.Kind
+	ar.TenantID = a.TenantID
+	ar.IDPID = a.IDPID
+	ar.ReturnTo = a.ReturnTo
+	ar.LinkToken = a.LinkToken
+	ar.SessionID = a.SessionID
+	ls.BState = ar.State
+	ls.BAttemptID = &a.ID
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// 顺序：先建 leg B 意图，再建引用它的关联会话，最后建具体请求；
+	// 任一失败整体回滚。
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO auth_attempts
+		 (id, token, kind, tenant_id, idp_id, return_to, link_token, session_id,
+		  status, request_seq, max_retries, expires_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		a.ID, a.Token, a.Kind, a.TenantID, a.IDPID, a.ReturnTo,
+		nullableStr(a.LinkToken), a.SessionID,
+		a.Status, a.RequestSeq, a.MaxRetries, a.ExpiresAt); err != nil {
+		return mapErr(err)
+	}
+	if _, err := tx.Exec(ctx,
 		`INSERT INTO link_sessions
 		 (token, tenant_id, anchor_member_id, session_id, target_idp_id,
-		  a_issuer, a_subject, a_auth_time, status, expires_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9)`,
+		  a_issuer, a_subject, a_auth_time, status, expires_at,
+		  b_state, b_attempt_id)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending',$9,$10,$11)`,
 		ls.Token, ls.TenantID, ls.AnchorMemberID, ls.SessionID, ls.TargetIDPID,
-		ls.AIssuer, ls.ASubject, nullableTime(ls.AAuthTime), ls.ExpiresAt)
-	return err
+		ls.AIssuer, ls.ASubject, nullableTime(ls.AAuthTime), ls.ExpiresAt,
+		ls.BState, ls.BAttemptID); err != nil {
+		return mapErr(err)
+	}
+	if err := insertAuthRequest(ctx, tx, ar); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *Store) LinkSession(ctx context.Context, token string) (*models.LinkSession, error) {
 	var ls models.LinkSession
 	var aAuth, bAuth sql.NullTime
+	var bAttemptID uuid.NullUUID
 	err := s.pool.QueryRow(ctx,
 		`SELECT token, tenant_id, anchor_member_id, session_id, target_idp_id,
 		        a_issuer, a_subject, a_auth_time,
 		        b_issuer, b_subject, b_email, b_auth_time, b_idp_id, b_state,
-		        status, expires_at
+		        status, expires_at, b_attempt_id
 		 FROM link_sessions WHERE token = $1`, token,
 	).Scan(&ls.Token, &ls.TenantID, &ls.AnchorMemberID, &ls.SessionID,
 		&ls.TargetIDPID, &ls.AIssuer, &ls.ASubject, &aAuth,
 		&ls.BIssuer, &ls.BSubject, &ls.BEmail, &bAuth, &ls.BIDPID, &ls.BState,
-		&ls.Status, &ls.ExpiresAt)
+		&ls.Status, &ls.ExpiresAt, &bAttemptID)
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	ls.AAuthTime = aAuth
 	ls.BAuthTime = bAuth
+	if bAttemptID.Valid {
+		id := bAttemptID.UUID
+		ls.BAttemptID = &id
+	}
 	return &ls, nil
 }
 
@@ -399,21 +771,6 @@ func (s *Store) AttachLinkLegB(ctx context.Context, token, state, issuer, subjec
 		issuer, subject, email, authTime, idpID, token, state)
 	if err != nil {
 		return mapErr(err)
-	}
-	if tag.RowsAffected() != 1 {
-		return ErrConflict
-	}
-	return nil
-}
-
-// SetLinkLegBState 记录 leg B 待消费的 state（绑定在关联会话上，回调必须与之一致）。
-func (s *Store) SetLinkLegBState(ctx context.Context, token, state string) error {
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE link_sessions SET b_state = $1
-		 WHERE token = $2 AND status = 'pending' AND b_state = '' AND expires_at > now()`,
-		state, token)
-	if err != nil {
-		return err
 	}
 	if tag.RowsAffected() != 1 {
 		return ErrConflict

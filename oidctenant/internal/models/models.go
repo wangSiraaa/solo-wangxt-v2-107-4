@@ -62,6 +62,33 @@ type AuthRequest struct {
 	LinkToken    NullString
 	SessionID    *uuid.UUID
 	CreatedAt    time.Time
+	// AttemptID 关联本次请求所属的用户意图；RequestSeq 为代次（首次为 1）。
+	AttemptID  *uuid.UUID
+	RequestSeq int
+}
+
+// AuthAttempt 是一次用户认证意图（登录或关联），跨多次具体 OIDC 请求存活。
+// 每个 attempt 同时至多有一个未消费的具体请求（auth_requests 部分唯一索引保证）。
+type AuthAttempt struct {
+	ID                     uuid.UUID
+	Token                  string
+	Kind                   string
+	TenantID               uuid.UUID
+	IDPID                  uuid.UUID
+	ReturnTo               string
+	LinkToken              NullString
+	SessionID              *uuid.UUID
+	Status                 string
+	RequestSeq             int
+	MaxRetries             int
+	LastFailureKind        NullString
+	LastFailureRecoverable bool
+	LastFailureAt          NullTime
+	// FailedRequestSeq 是最近一次失败所属的具体请求代次（0 表示尚无失败）。
+	FailedRequestSeq int
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+	FinishedAt       NullTime
 }
 
 type Session struct {
@@ -87,6 +114,7 @@ type LinkSession struct {
 	BAuthTime      NullTime
 	BIDPID         uuid.UUID
 	BState         string
+	BAttemptID     *uuid.UUID
 	Status         string
 	ExpiresAt      time.Time
 }

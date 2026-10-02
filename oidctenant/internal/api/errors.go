@@ -20,6 +20,8 @@ const (
 	ErrInvalidRequest ErrorType = "invalid_request"
 	// ErrReauthRequired 关联账号时身份未在规定时间内重新认证。
 	ErrReauthRequired ErrorType = "reauthentication_required"
+	// ErrAttemptGone 恢复入口不可用：意图不存在、已过期、已终结或不属于当前会话。
+	ErrAttemptGone ErrorType = "attempt_unavailable"
 )
 
 // APIError 携带 HTTP 状态、稳定错误码与可展示的简短描述。

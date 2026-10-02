@@ -59,7 +59,7 @@ func (m *Manager) get(ctx context.Context, issuer string, fingerprint time.Time)
 	defer cancel()
 	p, err := gooidc.NewProvider(discCtx, issuer)
 	if err != nil {
-		return nil, fmt.Errorf("oidc discovery for %q: %w", issuer, err)
+		return nil, fmt.Errorf("oidc discovery for %q: %w", issuer, ClassifyDiscoveryError(err))
 	}
 
 	m.mu.Lock()

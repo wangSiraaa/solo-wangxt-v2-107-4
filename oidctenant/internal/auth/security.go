@@ -33,6 +33,9 @@ func SessionToken() (string, error) { return RandomToken(32) }
 // LinkToken 返回账号关联会话的不透明令牌（256 bit 熵）。
 func LinkToken() (string, error) { return RandomToken(32) }
 
+// AttemptToken 返回认证意图恢复入口的不透明令牌（256 bit 熵）。
+func AttemptToken() (string, error) { return RandomToken(32) }
+
 // HashToken 返回令牌的 SHA-256 摘要用于数据库存储/恒定时间比较。
 func HashToken(token string) []byte {
 	sum := sha256.Sum256([]byte(token))
